@@ -19,6 +19,147 @@ L'objectif de ce laboratoire est de neutraliser les mécanismes de sécurité d'
     *   `adb` (Android Debug Bridge).
     *   Scripts JS personnalisés : `bypass_root.js`, `bypass_native.js`.
 
+```javascript
+// bypass_root.js — Neutralise des checks Java courants (Build.TAGS, File.exists, Runtime.exec, RootBeer)
+
+function safeContains(str, needle) {
+  try { return (str || "").toLowerCase().indexOf((needle||"").toLowerCase()) !== -1; } catch (_) { return false; }
+}
+
+const suspiciousPaths = [
+  "/system/bin/su", "/system/xbin/su", "/sbin/su", "/system/su",
+  "/system/app/Superuser.apk", "/system/app/SuperSU.apk",
+  "/system/bin/.ext/.su", "/system/usr/we-need-root/",
+  "/system/xbin/daemonsu", "/system/etc/init.d/99SuperSUDaemon",
+  "/system/bin/busybox", "/system/xbin/busybox"
+];
+
+Java.perform(function () {
+  // 1) Forcer Build.TAGS à une valeur non suspecte
+  try {
+    const Build = Java.use('android.os.Build');
+    Object.defineProperty(Build, 'TAGS', { get: function() { return 'release-keys'; } });
+    console.log('[+] Hook Build.TAGS -> release-keys');
+  } catch (e) { console.log('[-] Build.TAGS hook failed:', e); }
+
+  // 2) RootBeer (si présent)
+  try {
+    const RootBeer = Java.use('com.scottyab.rootbeer.RootBeer');
+    RootBeer.isRooted.implementation = function () { console.log('[+] RootBeer.isRooted -> false'); return false; };
+    if (RootBeer.isRootedWithBusyBoxCheck) {
+      RootBeer.isRootedWithBusyBoxCheck.implementation = function () { console.log('[+] RootBeer.isRootedWithBusyBoxCheck -> false'); return false; };
+    }
+  } catch (e) { console.log('[*] RootBeer non présent ou nom différent:', e.message); }
+
+  // 3) File.exists -> retourner false pour chemins suspects
+  try {
+    const File = Java.use('java.io.File');
+    File.exists.implementation = function () {
+      const path = this.getAbsolutePath();
+      if (suspiciousPaths.indexOf(path) !== -1) {
+        console.log('[+] File.exists bypass for', path);
+        return false;
+      }
+      return this.exists.call(this);
+    };
+  } catch (e) { console.log('[-] File.exists hook failed:', e); }
+
+  // 4) Runtime.exec -> bloquer su/which/busybox
+  try {
+    const Runtime = Java.use('java.lang.Runtime');
+    const JString = Java.use('java.lang.String');
+    const StringArray = Java.use('[Ljava.lang.String;');
+
+    function blockIfSuspicious(cmdOrArr) {
+      const joined = Array.isArray(cmdOrArr) ? cmdOrArr.join(' ') : ('' + cmdOrArr);
+      if (safeContains(joined, ' su') || joined.trim().toLowerCase().startsWith('su') || safeContains(joined, 'which su') || safeContains(joined, 'busybox')) {
+        console.log('[+] Blocked Runtime.exec:', joined);
+        return ['sh', '-c', 'echo'];
+      }
+      return null;
+    }
+
+    // exec(String)
+    Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
+      const repl = blockIfSuspicious(cmd);
+      return repl ? this.exec(JString.$new(repl.join(' '))) : this.exec(cmd);
+    };
+    // exec(String[])
+    Runtime.exec.overload('[Ljava.lang.String;').implementation = function (arr) {
+      const js = arr ? Array.from(arr) : [];
+      const repl = blockIfSuspicious(js);
+      if (repl) {
+        const a = StringArray.$new(repl.length);
+        for (let i = 0; i < repl.length; i++) a[i] = JString.$new(repl[i]);
+        return this.exec(a);
+      }
+      return this.exec(arr);
+    };
+    // exec(String, String[])
+    Runtime.exec.overload('java.lang.String', '[Ljava.lang.String;').implementation = function (cmd, envp) {
+      const repl = blockIfSuspicious(cmd);
+      return repl ? this.exec(JString.$new(repl.join(' ')), envp) : this.exec(cmd, envp);
+    };
+    // exec(String[], String[])
+    Runtime.exec.overload('[Ljava.lang.String;', '[Ljava.lang.String;').implementation = function (arr, envp) {
+      const js = arr ? Array.from(arr) : [];
+      const repl = blockIfSuspicious(js);
+      if (repl) {
+        const a = StringArray.$new(repl.length);
+        for (let i = 0; i < repl.length; i++) a[i] = JString.$new(repl[i]);
+        return this.exec(a, envp);
+      }
+      return this.exec(arr, envp);
+    };
+
+    console.log('[+] Hooks Runtime.exec installés');
+  } catch (e) { console.log('[-] Runtime.exec hooks failed:', e); }
+
+  console.log('[+] Java layer bypass installed');
+});
+```
+
+```javascript
+// bypass_native.js — Neutralise open/openat/access/stat/lstat sur chemins suspects
+
+const SUS = [
+  '/system/bin/su', '/system/xbin/su', '/sbin/su', '/system/su',
+  '/system/bin/busybox', '/system/xbin/busybox'
+];
+
+function isSuspiciousPath(ptrPath) {
+  try { const p = ptrPath.readCString(); return !!p && (SUS.indexOf(p) !== -1 || p.indexOf('/proc/mounts') !== -1 || p.indexOf('/proc/self/mounts') !== -1); } catch (_) { return false; }
+}
+
+function hookFunc(name, argIndexForPath) {
+  try {
+    const addr = Module.getExportByName(null, name);
+    Interceptor.attach(addr, {
+      onEnter(args) {
+        const pathPtr = argIndexForPath >= 0 ? args[argIndexForPath] : null;
+        if (pathPtr && isSuspiciousPath(pathPtr)) {
+          this.block = true;
+          this.path = pathPtr.readCString();
+        }
+      },
+      onLeave(retval) {
+        if (this.block) {
+          console.log('[+] Blocked', name, 'on', this.path);
+          retval.replace(ptr(-1));
+        }
+      }
+    });
+    console.log('[+] Hooked', name);
+  } catch (e) { /* silencieux si non dispo sur la plateforme */ }
+}
+
+hookFunc('open', 0);     // int open(const char *pathname, int flags, ...)
+hookFunc('openat', 1);   // int openat(int dirfd, const char *pathname, int flags, ...)
+hookFunc('access', 0);   // int access(const char *pathname, int mode)
+hookFunc('stat', 0);     // int stat(const char *pathname, struct stat *buf)
+hookFunc('lstat', 0);    // int lstat(const char *pathname, struct stat *buf)
+```
+
 ---
 
 ## 🛠️ 3. Méthodologie et Commandes
@@ -37,6 +178,8 @@ Nous listons les applications installées pour obtenir l'identifiant exact du pa
 frida-ps -Uai | findstr uncrackable
 :: Résultat : owasp.mstg.uncrackable1
 ```
+<img width="696" height="61" alt="image" src="https://github.com/user-attachments/assets/4d6ad180-5f4a-4885-b6ff-f69ed2d515bb" />
+
 
 ### Étape 3 : Injection Dynamique
 L'attaque est lancée en forçant le démarrage de l'application avec nos scripts de hook[cite: 1].
